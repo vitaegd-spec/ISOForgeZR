@@ -1,5 +1,7 @@
 # ISOForge(ZR)
 
+<img width="256" alt="image" src="images/ISOForge.png" />
+
 **A modern, lightweight Windows editor for ISO disc images and ZIP, 7Z, RAR and self-extracting archives — all with one open / edit / extract / save workflow.**
 
 Version **2.8.1** · Python 3.13 · PySide6 · MIT License · © 2026 Vires IT Consultants
