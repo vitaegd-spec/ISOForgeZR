@@ -1,6 +1,6 @@
 # ISOForge(ZR)
 
-<img width="256" alt="image" src="images/ISOForge.png" />
+<img width="611" alt="image" src="images/ISOForge.png" />
 
 **A modern, lightweight Windows editor for ISO disc images and ZIP, 7Z, RAR and self-extracting archives — all with one open / edit / extract / save workflow.**
 
