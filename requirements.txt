@@ -1,0 +1,24 @@
+# Core UI + ISO support
+#   PySide6 also supplies QtNetwork, which app/single_instance.py uses to
+#   coalesce Explorer's one-process-per-selected-file context-menu
+#   launches back into a single operation.
+PySide6>=6.5
+pycdlib>=1.14
+
+# Archive support (ISOForge ZR)
+#   py7zr    -> 7Z read/write, including AES-256 encryption
+#   pyzipper -> ZIP AES-256 encryption (stdlib zipfile cannot CREATE
+#               encrypted zips; it can only read legacy ZipCrypto ones)
+#   rarfile  -> RAR reading.
+py7zr>=0.20
+pyzipper>=0.3.6
+rarfile>=4.0
+
+# NOTE on RAR: the RAR format is proprietary, so neither reading nor
+# writing can be done by Python alone.
+#   * READING  needs UnRAR.exe (or Rar.exe, or bsdtar).
+#   * WRITING  needs RARLAB's Rar.exe specifically.
+# Both ship with WinRAR and cannot be bundled with ISOForge for
+# licensing reasons. Point ISOForge at them under Tools > Settings, or
+# simply drop them into the ISOForge folder -- they are detected
+# automatically. See app/rar_tools.py for the full explanation.
