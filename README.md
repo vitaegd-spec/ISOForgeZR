@@ -2,7 +2,7 @@
 
 **A modern, lightweight Windows editor for ISO and CHD disc images and ZIP, 7Z, RAR and self-extracting archives — all with one open / edit / extract / save workflow.**
 
-Version **2.10.1** · Python 3.13 · PySide6 · MIT License · © 2026 Vires IT Consultants
+Version **2.10.3** · Python 3.13 · PySide6 · MIT License · © 2026 Vires IT Consultants
 
 ---
 
