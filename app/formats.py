@@ -19,7 +19,7 @@ Capabilities are not all static
 ISO / ZIP / 7Z can always be both read and written -- those are handled
 by pure-Python libraries that ship with the app.
 
-RAR and SFX are different, and deliberately DYNAMIC, for the same
+RAR, SFX and CHD are different, and deliberately DYNAMIC, for the same
 underlying reason: each needs a binary ISOForge cannot legally or
 practically ship.
 
@@ -30,6 +30,12 @@ practically ship.
     archive concatenated onto it. ISOForge can do the concatenating, but
     cannot compile a Windows PE binary, so it needs a stub module -- most
     easily one of the free ones 7-Zip ships (see `sfx_tools`).
+  * CHD -- a compressed disc image, produced and unpacked by MAME's
+    `chdman.exe`. ISOForge cannot read or write the format itself, so it
+    drives the tool, as for RAR (see `chd_tools` and `chd_backend`). Unlike
+    the archive formats a CHD holds a DISC IMAGE, so a project opened from
+    one behaves like an ISO project (it has a volume label, for instance):
+    see `is_disc_image()`.
 
 So `can_write()` asks those modules at call time rather than answering
 from a fixed table:
@@ -66,12 +72,14 @@ ZIP = "zip"
 SEVENZ = "7z"
 RAR = "rar"
 SFX = "sfx"
+CHD = "chd"
 
 ARCHIVE_FORMATS = (ZIP, SEVENZ, RAR, SFX)
-ALL_FORMATS = (ISO,) + ARCHIVE_FORMATS
+ALL_FORMATS = (ISO, CHD) + ARCHIVE_FORMATS
 
 _EXT_TO_FORMAT = {
     ".iso": ISO,
+    ".chd": CHD,
     ".zip": ZIP,
     ".7z": SEVENZ,
     ".rar": RAR,
@@ -88,6 +96,7 @@ _EXT_TO_FORMAT = {
 
 _FORMAT_LABELS = {
     ISO: "ISO disc image",
+    CHD: "CHD disc image",
     ZIP: "ZIP archive",
     SEVENZ: "7-Zip archive",
     RAR: "RAR archive",
@@ -96,6 +105,7 @@ _FORMAT_LABELS = {
 
 _PRIMARY_EXT = {
     ISO: ".iso",
+    CHD: ".chd",
     ZIP: ".zip",
     SEVENZ: ".7z",
     RAR: ".rar",
@@ -126,6 +136,13 @@ def is_iso(fmt: Optional[str]) -> bool:
     return fmt == ISO
 
 
+def is_disc_image(fmt: Optional[str]) -> bool:
+    """True for formats that hold a DISC IMAGE rather than a plain list of
+    files: ISO, and CHD (which wraps one). Such projects have a volume label
+    and are subject to the ISO path-length advisory; archives are not."""
+    return fmt in (ISO, CHD)
+
+
 def can_write(fmt: Optional[str]) -> bool:
     """Whether ISOForge can currently CREATE this format.
 
@@ -141,6 +158,9 @@ def can_write(fmt: Optional[str]) -> bool:
     if fmt == SFX:
         from . import sfx_tools
         return sfx_tools.can_create_sfx()
+    if fmt == CHD:
+        from . import chd_tools
+        return chd_tools.can_convert()
     return False
 
 
@@ -156,6 +176,8 @@ def writable_formats() -> tuple:
         out.append(RAR)
     if can_write(SFX):
         out.append(SFX)
+    if can_write(CHD):
+        out.append(CHD)
     return tuple(out)
 
 
@@ -187,14 +209,17 @@ def suggested_write_format(fmt: Optional[str]) -> str:
     """Given the format a project was OPENED from, returns the format it
     should be SAVED as.
 
-    Identity for anything writable -- including RAR and SFX once their
+    Identity for anything writable -- including RAR, SFX and CHD once their
     tools are configured, so a file opened and edited saves straight back
-    in its own format. Only when that isn't possible does this fall back
-    to 7Z, the closest generally-available equivalent (solid compression
+    in its own format. Only when that isn't possible does this fall back:
+    to ISO for a CHD (the same disc image, just uncompressed), and to 7Z for
+    the rest, the closest generally-available equivalent (solid compression
     and AES-256, like RAR, and the payload SFX usually carries anyway).
     """
     if can_write(fmt):
         return fmt
+    if fmt == CHD:
+        return ISO
     return SEVENZ
 
 
@@ -212,8 +237,9 @@ def open_dialog_filter() -> str:
     archive -- ISOForge can open one and show what's inside it.
     """
     return (
-        "All supported files (*.iso *.zip *.7z *.rar *.exe *.cbz *.cbr);;"
+        "All supported files (*.iso *.chd *.zip *.7z *.rar *.exe *.cbz *.cbr);;"
         "ISO disc images (*.iso);;"
+        "CHD disc images (*.chd);;"
         "ZIP archives (*.zip *.cbz);;"
         "7-Zip archives (*.7z);;"
         "RAR archives (*.rar *.cbr);;"
@@ -240,6 +266,8 @@ def format_from_save_filter(selected_filter: str) -> Optional[str]:
     low = (selected_filter or "").lower()
     if "*.iso" in low:
         return ISO
+    if "*.chd" in low:
+        return CHD
     if "*.zip" in low:
         return ZIP
     if "*.7z" in low:
@@ -262,3 +290,4 @@ def ensure_extension(path: str, fmt: Optional[str]) -> str:
     if os.path.splitext(path)[1].lower() == ext:
         return path
     return path + ext
+

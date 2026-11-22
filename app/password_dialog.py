@@ -18,12 +18,14 @@ from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit,
+    QCheckBox, QDialogButtonBox, QFormLayout, QLabel, QLineEdit,
     QVBoxLayout,
 )
 
+from .dialog_base import ForgeDialog
 
-class PasswordPromptDialog(QDialog):
+
+class PasswordPromptDialog(ForgeDialog):
     """Asks for the password needed to READ an encrypted archive.
 
     `retry_message` lets the caller re-show this dialog after a rejected
@@ -36,7 +38,6 @@ class PasswordPromptDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Password Required")
         self.setMinimumWidth(420)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
@@ -92,7 +93,7 @@ class PasswordPromptDialog(QDialog):
         return self.pw_edit.text()
 
 
-class EncryptionPromptDialog(QDialog):
+class EncryptionPromptDialog(ForgeDialog):
     """Offers optional password protection when SAVING an archive.
 
     Encryption is off by default and the dialog is skipped entirely for
@@ -105,7 +106,6 @@ class EncryptionPromptDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Protect Archive")
         self.setMinimumWidth(460)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
@@ -210,3 +210,4 @@ class EncryptionPromptDialog(QDialog):
         if not self.enable_check.isChecked():
             return None
         return self.pw_edit.text() or None
+

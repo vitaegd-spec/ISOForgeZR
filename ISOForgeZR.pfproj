@@ -1,6 +1,6 @@
 {
   "name": "ISOForgeZR",
-  "version": "2.8.1",
+  "version": "2.10.1",
   "publisher": "VIRES IT Consultants",
   "website": "www.vires.co.za",
   "description": "File archiver and un-archiver for ZIP, 7Z , RAR, ISO and SFX files.",
@@ -32,3 +32,7 @@
   "generate_manifest": true,
   "format_version": 1
 }
+
+
+
+

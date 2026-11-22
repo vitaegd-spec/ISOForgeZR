@@ -262,6 +262,44 @@ def icon_convert() -> QIcon:
     return _finish(pm, p)
 
 
+def icon_convert_chd() -> QIcon:
+    """A disc squeezed from both sides -- 'compress this disc image'.
+
+    Deliberately distinct from `icon_convert` (a folder turning into a
+    document) so the two adjacent toolbar buttons can be told apart at a
+    glance.
+    """
+    pm, p = _canvas()
+    cx, cy = 14.0, 14.0
+    p.setPen(Qt.NoPen)
+    p.setBrush(ACCENT)
+    p.drawEllipse(QPointF(cx, cy), 8.6, 8.6)
+    p.setBrush(PAPER)
+    p.drawEllipse(QPointF(cx, cy), 3.2, 3.2)
+    p.setBrush(ACCENT_DARK)
+    p.drawEllipse(QPointF(cx, cy), 1.3, 1.3)
+    # A highlight arc, so it reads as a shiny disc rather than a donut.
+    p.setPen(QPen(PAPER, 1.3, Qt.SolidLine, Qt.RoundCap))
+    p.setBrush(Qt.NoBrush)
+    p.drawArc(QRectF(cx - 6.4, cy - 6.4, 12.8, 12.8), 110 * 16, 70 * 16)
+    # Inward-pointing triangles on both sides.
+    p.setPen(Qt.NoPen)
+    p.setBrush(OK)
+    left = QPainterPath()
+    left.moveTo(0.8, 9.0)
+    left.lineTo(5.2, 14.0)
+    left.lineTo(0.8, 19.0)
+    left.closeSubpath()
+    p.drawPath(left)
+    right = QPainterPath()
+    right.moveTo(27.2, 9.0)
+    right.lineTo(22.8, 14.0)
+    right.lineTo(27.2, 19.0)
+    right.closeSubpath()
+    p.drawPath(right)
+    return _finish(pm, p)
+
+
 def icon_settings() -> QIcon:
     """A gear, used for Tools > Settings.
 
@@ -504,3 +542,4 @@ def file_pixmap(ext: str = "", size: int = 18) -> QPixmap:
     _draw_doc(p, QRectF(3, 1, size - 6, size - 2), fold=size * 0.28)
     p.end()
     return pm
+

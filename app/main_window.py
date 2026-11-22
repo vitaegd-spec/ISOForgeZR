@@ -26,9 +26,24 @@ Explorer integration
 one process per selected file, and are folded back into a single action
 by `single_instance` before reaching `handle_shell_request()`.
 
-Extract verbs run WITHOUT showing this window -- the user asked for
-files on disk, not an editor -- while Open and Compress show it, since
-the next step is theirs to take.
+Extract verbs and Convert-to-CHD run WITHOUT showing this window -- the
+user asked for files on disk, not an editor -- while Open and Compress
+show it, since the next step is theirs to take.
+
+CHD conversion
+===============
+"Convert Folder" (the original Convert action, renamed so the two can't be
+confused) builds an ISO or archive from a folder. "Convert to CHD" is a
+separate, single-purpose action that compresses a disc image (.cue, .gdi,
+.toc, .iso) into a CHD by driving MAME's chdman.exe -- see `chd_tools`.
+The toolbar/menu button and the Explorer verb share one code path
+(`_execute_chd_jobs`), so they behave identically.
+
+A CHD can also be OPENED and SAVED like any other container. It is handled as
+a disc image: opening unpacks it to a temporary ISO (see `chd_backend`), and
+saving builds an ISO and compresses it. A project opened from a CHD therefore
+behaves like an ISO project everywhere -- it has a volume label, the
+long-path advisory applies -- which is what `formats.is_disc_image()` is for.
 
 Cancellation
 =============
@@ -70,6 +85,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import archive_backend
+from . import chd_backend
+from . import chd_tools
 from . import formats
 from . import icons
 from . import iso_backend
@@ -80,7 +97,9 @@ from . import shell_commands
 from . import shell_integration
 from . import single_instance
 from . import theme
+from .dialog_base import ForgeDialog
 from .password_dialog import EncryptionPromptDialog, PasswordPromptDialog
+from .progress import PROGRESS_SCALE
 from .settings_dialog import SettingsDialog
 from .theme_toggle import ThemeToggle
 from .vfs import ForgeProject, VNode, find_long_paths
@@ -99,6 +118,10 @@ _ALLOWED_SETTINGS_KEYS = {
 _RESIZABLE_COLUMNS = (0, 1, 2)
 _DEFAULT_COLUMN_WIDTHS = {0: 340, 1: 90, 2: 130}
 LONG_PATH_WARN_THRESHOLD = 950
+
+# How long a headless Explorer verb (extract, CHD conversion) keeps listening
+# for more of the same selection after finishing, before the process exits.
+_HEADLESS_LINGER_MS = 2000
 
 
 def human_size(num: int) -> str:
@@ -271,8 +294,11 @@ class ProgressDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- #
-class ConvertDialog(QDialog):
-    """'Create a container from a folder' quick-convert wizard.
+class ConvertDialog(ForgeDialog):
+    """'Convert Folder' -- create a container from a folder.
+
+    (Shown to the user as "Convert Folder" so it isn't confused with the
+    separate "Convert to CHD" action, which works on disc images.)
 
     Format-aware: the output type drives which extension is suggested,
     whether the volume-label field is relevant (ISO only), and whether
@@ -283,13 +309,13 @@ class ConvertDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Create Archive or ISO from Folder")
+        self.setWindowTitle("Convert Folder")
         self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(14)
 
-        title = QLabel("Create from Folder")
+        title = QLabel("Convert Folder")
         title.setObjectName("SectionTitle")
         layout.addWidget(title)
 
@@ -357,7 +383,7 @@ class ConvertDialog(QDialog):
 
     def _on_format_changed(self, *_):
         fmt = self.selected_format()
-        is_iso = fmt == formats.ISO
+        is_iso = formats.is_disc_image(fmt)
         self.label_edit.setVisible(is_iso)
         self.label_row_label.setVisible(is_iso)
 
@@ -414,7 +440,186 @@ class ConvertDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- #
-class PropertiesDialog(QDialog):
+class ChdConvertDialog(ForgeDialog):
+    """'Convert to CHD' -- compress one disc image into a CHD file.
+
+    Deliberately small: a source image, an output name, and (only where it
+    genuinely matters) a disc type. A .cue/.gdi/.toc is always a CD image,
+    so the disc-type choice is disabled for those rather than offering an
+    option `chdman createdvd` can't honour. For an .iso it defaults to
+    "Automatic", which guesses CD vs DVD from the image's size -- see
+    `chd_tools.resolve_kind` -- and exists as a dropdown because that guess
+    can be wrong for a small DVD image (a PSP game, for instance).
+
+    Overwriting an existing CHD is confirmed HERE, so the code that does the
+    conversion never has to ask.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Convert to CHD")
+        self.setMinimumWidth(560)
+        self._suggested_out = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("Convert to CHD")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+
+        extensions = ", ".join(chd_tools.SOURCE_EXTENSIONS)
+        sub = QLabel(
+            f"Compress a disc image ({extensions}) into a CHD — the lossless, "
+            "compressed format used by MAME and most emulators. The original "
+            "files are left untouched."
+        )
+        sub.setObjectName("Muted")
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        src_row = QHBoxLayout()
+        self.src_edit = QLineEdit()
+        self.src_edit.setPlaceholderText("Choose a .cue, .gdi, .toc or .iso file")
+        src_btn = QPushButton("Browse...")
+        src_btn.clicked.connect(self._pick_source)
+        src_row.addWidget(self.src_edit)
+        src_row.addWidget(src_btn)
+        form.addRow("Source image:", src_row)
+
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItem("Automatic (recommended)", chd_tools.KIND_AUTO)
+        self.kind_combo.addItem("CD image", chd_tools.KIND_CD)
+        self.kind_combo.addItem("DVD image", chd_tools.KIND_DVD)
+        form.addRow("Disc type:", self.kind_combo)
+
+        out_row = QHBoxLayout()
+        self.out_edit = QLineEdit()
+        out_btn = QPushButton("Browse...")
+        out_btn.clicked.connect(self._pick_output)
+        out_row.addWidget(self.out_edit)
+        out_row.addWidget(out_btn)
+        form.addRow("Output file:", out_row)
+        layout.addLayout(form)
+
+        self.kind_hint = QLabel("")
+        self.kind_hint.setObjectName("Muted")
+        self.kind_hint.setWordWrap(True)
+        layout.addWidget(self.kind_hint)
+
+        tool = chd_tools.resolve_chdman()
+        self.tool_note = QLabel(
+            f"Using chdman: {tool}" if tool else
+            "chdman.exe was not found — set it under Tools > Settings.")
+        self.tool_note.setObjectName("Muted")
+        self.tool_note.setWordWrap(True)
+        layout.addWidget(self.tool_note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Convert")
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.src_edit.textChanged.connect(self._on_source_changed)
+        self.kind_combo.currentIndexChanged.connect(self._update_kind_hint)
+        self._update_kind_hint()
+
+    # -- helpers ----------------------------------------------------------- #
+    def selected_kind(self) -> str:
+        return self.kind_combo.currentData() or chd_tools.KIND_AUTO
+
+    def _source_text(self) -> str:
+        return self.src_edit.text().strip().strip('"')
+
+    def _on_source_changed(self, *_):
+        text = self._source_text()
+        if text and chd_tools.is_convertible(text):
+            suggested = chd_tools.default_output_path(text)
+            current = self.out_edit.text().strip()
+            # Only overwrite what the user hasn't typed themselves: an
+            # untouched (or previously auto-filled) field follows the
+            # source, a hand-edited one is left alone.
+            if not current or current == self._suggested_out:
+                self.out_edit.setText(suggested)
+            self._suggested_out = suggested
+        self._update_kind_hint()
+
+    def _update_kind_hint(self, *_):
+        text = self._source_text()
+        if not text or not os.path.isfile(text) or not chd_tools.is_convertible(text):
+            self.kind_combo.setEnabled(True)
+            self.kind_hint.setText("")
+            return
+        cd_only = os.path.splitext(text)[1].lower() in chd_tools.CD_ONLY_EXTENSIONS
+        self.kind_combo.setEnabled(not cd_only)
+        kind, reason = chd_tools.resolve_kind(text, self.selected_kind())
+        self.kind_hint.setText(
+            f"Will be converted as a {chd_tools.kind_label(kind)} image ({reason}).")
+
+    def _pick_source(self):
+        start = self._source_text()
+        start_dir = os.path.dirname(start) if start else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select disc image", start_dir, chd_tools.source_dialog_filter())
+        if path:
+            self.src_edit.setText(path)
+
+    def _pick_output(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save CHD as", self.out_edit.text().strip(),
+            filter="CHD files (*.chd)")
+        if path:
+            self.out_edit.setText(self._with_chd_extension(path))
+
+    @staticmethod
+    def _with_chd_extension(path: str) -> str:
+        if os.path.splitext(path)[1].lower() == ".chd":
+            return path
+        return path + ".chd"
+
+    def _on_accept(self):
+        src = self._source_text()
+        if not src:
+            QMessageBox.warning(self, APP_NAME, "Please choose a disc image to convert.")
+            return
+        try:
+            chd_tools.validate_source(src)
+        except chd_tools.ChdToolError as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        out = self.out_edit.text().strip()
+        if not out:
+            QMessageBox.warning(self, APP_NAME, "Please choose where to save the CHD.")
+            return
+        out = self._with_chd_extension(out)
+        if _same_file(out, src):
+            QMessageBox.warning(
+                self, APP_NAME, "The output file can't be the same as the source.")
+            return
+        if os.path.exists(out):
+            resp = QMessageBox.question(
+                self, APP_NAME,
+                f"'{os.path.basename(out)}' already exists. Replace it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+        self.out_edit.setText(out)
+        self.accept()
+
+    def values(self):
+        """(source, output, disc-type preference)."""
+        out = self._with_chd_extension(self.out_edit.text().strip())
+        return self._source_text(), out, self.selected_kind()
+
+
+# --------------------------------------------------------------------------- #
+class PropertiesDialog(ForgeDialog):
     def __init__(self, parent, title: str, rows: list):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -437,7 +642,7 @@ class PropertiesDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- #
-class HelpDialog(QDialog):
+class HelpDialog(ForgeDialog):
     """Displays the About/Help content in a scrollable, properly-sized
     dialog.
 
@@ -463,7 +668,6 @@ class HelpDialog(QDialog):
         self.setWindowTitle(title)
         self.setMinimumWidth(560)
         self.resize(720, 760)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -537,6 +741,10 @@ class MainWindow(QMainWindow):
         # Explorer's "Compress with ISOForge...", which has no save path
         # of its own yet.
         self._suggested_name: str = ""
+        # Paths already staged from Explorer into the CURRENT unsaved
+        # project. Lets a selection that arrives in more than one batch end
+        # up in one session -- see `stage_for_compression`.
+        self._shell_staged_paths: list = []
 
         self._build_ui()
         self._build_actions()
@@ -655,7 +863,7 @@ class MainWindow(QMainWindow):
 
         self.act_new = act("New", icons.icon_new_disc(), self.on_new, QKeySequence.New)
         self.act_open = act("Open", icons.icon_open_folder(), self.on_open, QKeySequence.Open,
-                            tip="Open an ISO, ZIP, 7Z, RAR or self-extracting archive")
+                            tip="Open an ISO, CHD, ZIP, 7Z, RAR or self-extracting archive")
         self.act_save = act("Save", icons.icon_save(), self.on_save, QKeySequence.Save)
         self.act_save_as = act("Save As", icons.icon_save_as(), self.on_save_as, "Ctrl+Shift+S")
         self.act_add_files = act("Add Files", icons.icon_add_files(), self.on_add_files,
@@ -671,8 +879,11 @@ class MainWindow(QMainWindow):
                               tip="Rename the selected item")
         self.act_properties = act("Properties", icons.icon_properties(), self.on_properties,
                                   tip="Show size and item counts")
-        self.act_convert = act("Convert", icons.icon_convert(), self.on_convert,
+        self.act_convert = act("Convert Folder", icons.icon_convert(), self.on_convert,
                                tip="Create an ISO or archive directly from a folder")
+        self.act_convert_chd = act("Convert to CHD", icons.icon_convert_chd(),
+                                   self.on_convert_chd,
+                                   tip="Compress a disc image (.cue, .gdi, .toc, .iso) to CHD")
         self.act_settings = act("Settings", icons.icon_settings(), self.on_settings,
                                 "Ctrl+,",
                                 tip="External tools and Explorer integration")
@@ -696,6 +907,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.act_properties)
         tb.addAction(self.act_convert)
+        tb.addAction(self.act_convert_chd)
         tb.addSeparator()
         tb.addAction(self.act_settings)
         tb.addAction(self.act_help)
@@ -740,6 +952,7 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(self.act_properties)
         tools_menu.addSeparator()
         tools_menu.addAction(self.act_convert)
+        tools_menu.addAction(self.act_convert_chd)
         tools_menu.addSeparator()
         tools_menu.addAction(self.act_settings)
 
@@ -811,7 +1024,8 @@ class MainWindow(QMainWindow):
         # "Rename Disc" only makes sense for ISO: archives have no
         # volume-label concept, so the action is hidden rather than
         # offered-then-ignored.
-        is_iso = self.project.fmt in (None, formats.ISO)
+        is_iso = (self.project.fmt is None
+                  or formats.is_disc_image(self.project.fmt))
         self.rename_volume_act.setVisible(is_iso)
 
     def _recent_list(self):
@@ -864,18 +1078,29 @@ class MainWindow(QMainWindow):
         worker = TaskWorker(fn, *args, **kwargs)
         self._active_worker = worker
 
+        def release_worker():
+            # The worker reports its result from INSIDE run(), so the thread
+            # is still finishing when these slots execute. Dropping the last
+            # reference to a QThread that has not exited yet destroys it
+            # mid-flight, which crashes the application (reproducible when
+            # two tasks run back to back). wait() returns as soon as run()
+            # has returned -- effectively immediately -- and makes releasing
+            # it safe.
+            worker.wait()
+            self._active_worker = None
+
         def handle_progress(text, done, total):
             dlg.update_progress(text, done, total)
 
         def handle_success(result):
             dlg.accept()
-            self._active_worker = None
+            release_worker()
             if on_success:
                 on_success(result)
 
         def handle_failure(message):
             dlg.reject()
-            self._active_worker = None
+            release_worker()
             if on_error:
                 on_error(message)
             else:
@@ -883,7 +1108,7 @@ class MainWindow(QMainWindow):
 
         def handle_cancelled():
             dlg.reject()
-            self._active_worker = None
+            release_worker()
             if on_cancelled:
                 on_cancelled()
             else:
@@ -1167,7 +1392,7 @@ class MainWindow(QMainWindow):
         menu.addAction(self.act_extract)
 
         if node is self.project.root:
-            if self.project.fmt in (None, formats.ISO):
+            if self.project.fmt is None or formats.is_disc_image(self.project.fmt):
                 rename_act = QAction(icons.icon_rename(), "Rename Disc...", self)
                 rename_act.triggered.connect(self._rename_volume_flow)
                 menu.addAction(rename_act)
@@ -1211,7 +1436,7 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard_if_dirty():
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open ISO or Archive", filter=formats.open_dialog_filter())
+            self, "Open Disc Image or Archive", filter=formats.open_dialog_filter())
         if path:
             self._open_path(path)
 
@@ -1225,11 +1450,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, APP_NAME,
                 f"'{os.path.basename(path)}' isn't a file type ISOForge "
-                "recognises.\n\nSupported: .iso, .zip, .7z, .rar, .exe")
+                "recognises.\n\nSupported: .iso, .chd, .zip, .7z, .rar, .exe")
             return
 
         if formats.is_archive(fmt):
             self._open_archive_path(path, fmt)
+        elif fmt == formats.CHD:
+            self._open_chd_path(path)
         else:
             self._open_iso_path(path)
 
@@ -1247,6 +1474,38 @@ class MainWindow(QMainWindow):
             project.current_dir = project.root
             if progress_cb:
                 progress_cb("Done", 1, 1)
+            return project
+
+        self._run_task(f"Opening {os.path.basename(path)}", do_open,
+                       on_success=self._adopt_project(path))
+
+    def _open_chd_path(self, path: str):
+        """Opens a CHD by unpacking it to a temporary ISO (see `chd_backend`).
+
+        Unpacking a disc can take a while, so it runs behind the progress
+        dialog with a working Cancel -- `do_open` declares `cancel_token`,
+        which is what makes `_run_task` offer the button. If anything goes
+        wrong after the temporary image exists, it is released here so a
+        failed open never leaves gigabytes in the temp folder.
+        """
+        if not self._ensure_chdman("Opening a CHD file"):
+            return
+
+        def do_open(progress_cb=None, cancel_token=None):
+            source = chd_backend.open_chd(
+                path, progress_cb=progress_cb, cancel_token=cancel_token)
+            try:
+                project = ForgeProject()
+                project.source = source
+                project.fmt = formats.CHD
+                project.save_path = path
+                project.volume_label = os.path.splitext(
+                    os.path.basename(path))[0].upper()[:32]
+                source.populate(project.root)
+                project.current_dir = project.root
+            except BaseException:
+                source.close()
+                raise
             return project
 
         self._run_task(f"Opening {os.path.basename(path)}", do_open,
@@ -1395,6 +1654,13 @@ class MainWindow(QMainWindow):
                 "Install 7-Zip and ISOForge will find one automatically, "
                 "or point it at a module yourself."
             )
+        elif fmt == formats.CHD:
+            box.setText(
+                "CHD files can't be created yet.\n\n"
+                "Saving as CHD uses MAME's chdman.exe, which is free but "
+                "can't be bundled with ISOForge.\n\n"
+                "Point ISOForge at chdman.exe to enable saving as CHD."
+            )
         else:
             box.setText(
                 f"{formats.format_label(fmt)} files can't be created yet.\n\n"
@@ -1491,6 +1757,18 @@ class MainWindow(QMainWindow):
                     cancel_token=cancel_token,
                 )
                 return path, fmt, password, result
+        elif fmt == formats.CHD:
+            def do_save(progress_cb=None, cancel_token=None):
+                # The ISO is built from the project's own sources, never
+                # from the CHD on disk, so overwriting the CHD that is
+                # currently open is safe -- nothing needs releasing first.
+                result = chd_backend.build_chd(
+                    self.project.root, path,
+                    volume_label=self.project.volume_label,
+                    progress_cb=progress_cb,
+                    cancel_token=cancel_token,
+                )
+                return path, fmt, None, result
         else:
             def do_save(progress_cb=None, cancel_token=None):
                 result = iso_backend.build_iso(
@@ -1529,7 +1807,7 @@ class MainWindow(QMainWindow):
             note = ""
             if getattr(result, "used_fallback_format", False):
                 note = f"  —  format: {result.format_label}"
-            elif saved_fmt == formats.SFX or used_pw:
+            elif saved_fmt in (formats.SFX, formats.CHD) or used_pw:
                 # Worth stating outright for SFX: the label names the
                 # payload format, which decides who else can open it.
                 note = f"  —  {result.format_label}"
@@ -1587,7 +1865,8 @@ class MainWindow(QMainWindow):
         """Performs one (already merged) context-menu action.
 
         Returns True when the caller should quit afterwards -- i.e. this
-        was a headless extract with nothing left for the user to do.
+        was a headless extract or CHD conversion with nothing left for the
+        user to do.
         """
         if request is None:
             return False
@@ -1599,6 +1878,8 @@ class MainWindow(QMainWindow):
             self.raise_()
             self._open_path(request.paths[0])
             return False
+        if request.action == shell_commands.CONVERT_CHD:
+            return self.run_shell_chd_convert(request)
         return self.run_shell_extract(request)
 
     def stage_for_compression(self, paths) -> None:
@@ -1621,17 +1902,40 @@ class MainWindow(QMainWindow):
                 "None of the selected items could be found.")
             return
 
-        if self.project.dirty or self.project.source is not None:
-            # An already-busy window shouldn't silently discard whatever
-            # is open, so the new selection goes into a clean project
-            # only once the current one is safe to replace.
-            if not self._confirm_discard_if_dirty():
-                return
-            self.project.close_source()
-            self.project = ForgeProject()
-            self._warned_long_paths.clear()
+        # If this window is ALREADY holding an unsaved selection that came
+        # from Explorer, these files belong to it: they are the rest of the
+        # same selection, arriving a moment after the first batch was acted
+        # on (a slow-starting process, a busy machine). Adding them here is
+        # what keeps one selection in one session -- and avoids the worse
+        # alternative of asking the user to "discard" the files they have
+        # only just selected. `_suggested_name` is only ever set in exactly
+        # this state: it is cleared by New, Open and a successful Save.
+        joining = (bool(self._suggested_name)
+                   and self.project.save_path is None
+                   and self.project.source is None)
 
-        self._suggested_name = shell_commands.suggested_archive_name(existing)
+        if joining:
+            known = {os.path.normcase(os.path.abspath(q))
+                     for q in self._shell_staged_paths}
+            existing = [q for q in existing
+                        if os.path.normcase(os.path.abspath(q)) not in known]
+            if not existing:
+                return          # nothing new -- a duplicate delivery
+        else:
+            if self.project.dirty or self.project.source is not None:
+                # An already-busy window shouldn't silently discard whatever
+                # is open, so the new selection goes into a clean project
+                # only once the current one is safe to replace.
+                if not self._confirm_discard_if_dirty():
+                    return
+                self.project.close_source()
+                self.project = ForgeProject()
+                self._warned_long_paths.clear()
+            self._shell_staged_paths = []
+
+        self._shell_staged_paths.extend(existing)
+        self._suggested_name = shell_commands.suggested_archive_name(
+            self._shell_staged_paths)
         added = self._add_local_paths(existing)
         self._refresh_all()
 
@@ -1641,8 +1945,12 @@ class MainWindow(QMainWindow):
                 f"{len(missing)} selected item(s) could not be found and "
                 "were skipped.")
 
+        total = len(self._shell_staged_paths)
         self.status_left.setText(
-            f"Added {added} item(s) — choose Save As to pick a format.")
+            f"Added {added} item(s) — choose Save As to pick a format."
+            if total == added else
+            f"Added {added} more item(s), {total} in all — choose Save As "
+            "to pick a format.")
 
     def run_shell_extract(self, request) -> bool:
         """Extracts one or more archives without showing the editor.
@@ -1769,17 +2077,203 @@ class MainWindow(QMainWindow):
                 f"Extracted {len(succeeded)} archive(s), but "
                 f"{len(failed)} failed:\n\n" + "\n".join(lines))
 
+    # ================================================== CHD conversion
+    def _ensure_chdman(self, purpose: str = "Converting to CHD") -> bool:
+        """True if chdman.exe can be found; otherwise explains what's
+        needed and offers Settings, then re-checks.
+
+        Returns False when the user declines (or Settings still doesn't
+        yield a working path), so every caller simply stops. Shared by the
+        toolbar action and the Explorer verb -- the second can run with the
+        main window hidden, which is fine: the message box and the Settings
+        dialog both work with a hidden parent, exactly as the extract
+        verbs' password prompts already do.
+        """
+        if chd_tools.can_convert():
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(APP_NAME)
+        box.setText(
+            f"{purpose} needs chdman.exe.\n\n"
+            "It ships with MAME (free). Point ISOForge at your copy under "
+            "Tools > Settings and CHD support is enabled straight away, or "
+            "drop chdman.exe into the ISOForge folder."
+        )
+        settings_btn = box.addButton("Open Settings...", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        if box.clickedButton() is settings_btn:
+            self.on_settings()
+            return chd_tools.can_convert()
+        return False
+
+    def on_convert_chd(self):
+        """Toolbar / Tools menu: convert one disc image to CHD."""
+        if not self._ensure_chdman():
+            return
+        dlg = ChdConvertDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        src, out, preference = dlg.values()
+        succeeded, failed, cancelled = self._execute_chd_jobs(
+            [(src, out, preference)])
+        if cancelled:
+            # Nothing was written: convert_to_chd builds into a temp file
+            # and removes it on cancel.
+            self.status_left.setText("CHD conversion cancelled — nothing was written.")
+            return
+        self._report_chd_outcome(succeeded, failed)
+        if succeeded:
+            self.status_left.setText(f"Created {succeeded[0].output}")
+
+    def _execute_chd_jobs(self, jobs):
+        """Converts every (source, output, preference) in `jobs`, one after
+        another, behind a single progress dialog.
+
+        Returns (succeeded, failed, cancelled):
+          * succeeded -- a list of `chd_tools.ChdResult`;
+          * failed    -- a list of (file name, reason);
+          * cancelled -- True if the user clicked Cancel.
+
+        One file failing never stops the rest: each failure is recorded and
+        the loop moves on, which is what makes a multi-file Explorer
+        selection behave sensibly. Cancellation is different -- it ends the
+        whole batch. (`OperationCancelled` is a BaseException, so it passes
+        straight through the `except ChdToolError` below untouched.)
+        """
+        total_files = len(jobs)
+
+        def do_convert(progress_cb=None, cancel_token=None):
+            succeeded, failed = [], []
+            for index, (src, out, preference) in enumerate(jobs):
+                def report(label, done, total, index=index):
+                    if progress_cb is None:
+                        return
+                    prefix = f"[{index + 1}/{total_files}] " if total_files > 1 else ""
+                    overall = int((index * PROGRESS_SCALE + done) / total_files)
+                    progress_cb(prefix + label, overall, PROGRESS_SCALE)
+                try:
+                    succeeded.append(chd_tools.convert_to_chd(
+                        src, out, preference,
+                        progress_cb=report, cancel_token=cancel_token))
+                except chd_tools.ChdToolError as exc:
+                    failed.append((os.path.basename(src), str(exc)))
+            return succeeded, failed
+
+        outcome = {}
+        self._run_task(
+            "Converting to CHD", do_convert,
+            on_success=lambda result: outcome.update(result=result),
+            # Captured rather than shown: the caller reports everything
+            # together in one place.
+            on_error=lambda message: outcome.update(error=message),
+            on_cancelled=lambda: outcome.update(cancelled=True),
+        )
+        if outcome.get("cancelled"):
+            return [], [], True
+        if "error" in outcome:
+            return [], [("CHD conversion", outcome["error"])], False
+        succeeded, failed = outcome.get("result", ([], []))
+        return succeeded, failed, False
+
+    @staticmethod
+    def _chd_result_line(result) -> str:
+        line = os.path.basename(result.output)
+        if result.input_size > 0 and result.output_size > 0:
+            percent = result.output_size / result.input_size * 100
+            line += (f":  {human_size(result.input_size)} → "
+                     f"{human_size(result.output_size)}  ({percent:.0f}% of original)")
+        return line
+
+    def _report_chd_outcome(self, succeeded, failed) -> None:
+        """One summary for the whole batch, so converting ten images doesn't
+        mean dismissing ten dialogs."""
+        if succeeded and not failed:
+            if len(succeeded) == 1:
+                QMessageBox.information(
+                    self, APP_NAME,
+                    f"Created:\n{succeeded[0].output}\n\n"
+                    f"{self._chd_result_line(succeeded[0])}")
+            else:
+                shown = [f"• {self._chd_result_line(r)}" for r in succeeded[:8]]
+                more = len(succeeded) - 8
+                extra = f"\n...and {more} more." if more > 0 else ""
+                QMessageBox.information(
+                    self, APP_NAME,
+                    f"Converted {len(succeeded)} disc images to CHD:\n\n"
+                    + "\n".join(shown) + extra)
+            return
+
+        if failed and not succeeded:
+            if len(failed) == 1:
+                QMessageBox.critical(self, APP_NAME, failed[0][1])
+            else:
+                lines = [f"• {name}: {reason.splitlines()[0] if reason else ''}"
+                         for name, reason in failed[:6]]
+                QMessageBox.critical(
+                    self, APP_NAME,
+                    "Nothing could be converted:\n\n" + "\n".join(lines))
+            return
+
+        if failed:
+            lines = [f"• {name}: {reason.splitlines()[0] if reason else ''}"
+                     for name, reason in failed[:6]]
+            QMessageBox.warning(
+                self, APP_NAME,
+                f"Converted {len(succeeded)} disc image(s), but "
+                f"{len(failed)} failed:\n\n" + "\n".join(lines))
+
+    def run_shell_chd_convert(self, request) -> bool:
+        """Explorer's 'Convert to CHD with ISOForge' verb.
+
+        Each CHD is written NEXT TO its source, named after it. An existing
+        file is never overwritten -- a headless action has nobody to ask --
+        so a clash picks `name (2).chd` instead. The disc type is
+        automatic; use Tools > Convert to CHD when a DVD image needs to be
+        forced one way or the other.
+
+        Returns True so the caller quits: this window was never shown and
+        has nothing further to offer.
+        """
+        if not self._ensure_chdman():
+            return True
+
+        jobs, failed, reserved = [], [], []
+        for path in request.paths:
+            try:
+                chd_tools.validate_source(path)
+            except chd_tools.ChdToolError as exc:
+                failed.append((os.path.basename(path), str(exc)))
+                continue
+            out = chd_tools.unique_path(
+                chd_tools.default_output_path(path), reserved)
+            reserved.append(out)
+            jobs.append((path, out, chd_tools.KIND_AUTO))
+
+        succeeded = []
+        if jobs:
+            done, bad, cancelled = self._execute_chd_jobs(jobs)
+            if cancelled:
+                return True
+            succeeded = done
+            failed.extend(bad)
+
+        self._report_chd_outcome(succeeded, failed)
+        return True
+
     # ------------------------------------------------------------ misc
     def on_settings(self):
         """Tools > Settings — external tools and Explorer integration.
 
         Re-applying capabilities afterwards matters: enabling RAR or SFX
-        changes the Save As filter list and the Convert dialog's format
-        options, and the menus should reflect that immediately rather
-        than after a restart.
+        changes the Save As filter list and the Convert Folder dialog's
+        format options, and the menus should reflect that immediately
+        rather than after a restart.
         """
         rar_path, unrar_path, sfx_path = settings_store.load(ORG_NAME, APP_NAME)
-        dlg = SettingsDialog(self, rar_path, unrar_path, sfx_path)
+        chdman_path = settings_store.load_chdman(ORG_NAME, APP_NAME)
+        dlg = SettingsDialog(self, rar_path, unrar_path, sfx_path, chdman_path)
         if dlg.exec() != QDialog.Accepted:
             return
 
@@ -1787,6 +2281,7 @@ class MainWindow(QMainWindow):
         before = {fmt: formats.can_write(fmt)
                   for fmt in (formats.RAR, formats.SFX)}
         settings_store.save(ORG_NAME, APP_NAME, new_rar, new_unrar, new_sfx)
+        settings_store.save_chdman(ORG_NAME, APP_NAME, dlg.chdman_value())
         after = {fmt: formats.can_write(fmt)
                  for fmt in (formats.RAR, formats.SFX)}
 
@@ -1832,10 +2327,11 @@ class MainWindow(QMainWindow):
         """
         if values is None:
             return
-        archives, create = values
+        archives, create, chd = values
         try:
-            if archives or create:
-                shell_integration.register(archives=archives, create=create)
+            if archives or create or chd:
+                shell_integration.register(
+                    archives=archives, create=create, chd=chd)
             else:
                 shell_integration.unregister()
         except shell_integration.ShellIntegrationError as exc:
@@ -1953,7 +2449,7 @@ class MainWindow(QMainWindow):
         if node is None:
             return
         if node is self.project.root:
-            if self.project.fmt in (None, formats.ISO):
+            if self.project.fmt is None or formats.is_disc_image(self.project.fmt):
                 self._rename_volume_flow()
         else:
             self._rename_node_flow(node)
@@ -1980,6 +2476,10 @@ class MainWindow(QMainWindow):
                 rows.append(
                     ("Note", "Read-only — install 7-Zip, or set an SFX module "
                              "under Tools > Settings, to save as .exe."))
+            if self.project.fmt == formats.CHD and not formats.can_write(formats.CHD):
+                rows.append(
+                    ("Note", "Read-only — set chdman.exe under Tools > Settings "
+                             "to enable saving as CHD."))
             PropertiesDialog(self, "Properties", rows).exec()
             return
 
@@ -2013,6 +2513,12 @@ class MainWindow(QMainWindow):
             def do_convert(progress_cb=None, cancel_token=None):
                 result = archive_backend.quick_folder_to_archive(
                     src, out, fmt, password=password, progress_cb=progress_cb,
+                    cancel_token=cancel_token)
+                return out, result
+        elif fmt == formats.CHD:
+            def do_convert(progress_cb=None, cancel_token=None):
+                result = chd_backend.quick_folder_to_chd(
+                    src, out, volume_label=label, progress_cb=progress_cb,
                     cancel_token=cancel_token)
                 return out, result
         else:
@@ -2059,6 +2565,7 @@ class MainWindow(QMainWindow):
         self.act_rename.setIcon(icons.icon_rename())
         self.act_properties.setIcon(icons.icon_properties())
         self.act_convert.setIcon(icons.icon_convert())
+        self.act_convert_chd.setIcon(icons.icon_convert_chd())
         self.act_settings.setIcon(icons.icon_settings())
         self.act_help.setIcon(icons.icon_help())
         self.back_btn.setIcon(icons.icon_nav("left"))
@@ -2081,6 +2588,13 @@ class MainWindow(QMainWindow):
             "<b>Self-extracting archives aren't available yet.</b> Install "
             "7-Zip (free), or set an SFX module under Tools &gt; Settings."
         )
+        chd_state = (
+            "<b>CHD conversion is available</b> — use <i>Convert to CHD</i> "
+            "on the toolbar, or right-click a disc image in Explorer."
+            if chd_tools.can_convert() else
+            "<b>CHD conversion isn't available yet.</b> Set <i>chdman.exe</i> "
+            "(it ships with MAME) under Tools &gt; Settings."
+        )
         shell_state = ""
         if shell_integration.is_supported():
             shell_state = (
@@ -2090,7 +2604,8 @@ class MainWindow(QMainWindow):
                 "<i>Open / Extract Here / Extract to subfolder</i>, or "
                 "right-click any files or folders for <i>Compress with "
                 "ISOForge…</i>. Selecting several items groups them into one "
-                "archive.</p>"
+                "archive. A third option adds <i>Convert to CHD with "
+                "ISOForge</i> to .cue, .gdi, .toc and .iso files.</p>"
                 f"<p>{shell_integration.status_summary()}</p>"
             )
         text = (
@@ -2145,6 +2660,29 @@ class MainWindow(QMainWindow):
             "<b>Tools &gt; Settings</b>. Dropping them into the ISOForge folder "
             "works too — they're detected automatically.</p>"
             + shell_state +
+            "<h4>Convert Folder</h4>"
+            "<p><b>Convert Folder</b> builds an ISO or archive straight from "
+            "a folder on disk, without creating a project first.</p>"
+            "<h4>Converting to CHD</h4>"
+            f"<p>{chd_state}</p>"
+            "<p>CHD is the lossless, compressed disc-image format used by "
+            "MAME and most emulators. <b>Convert to CHD</b> accepts "
+            "<code>.cue</code>, <code>.gdi</code>, <code>.toc</code> and "
+            "<code>.iso</code> files and writes a <code>.chd</code> beside "
+            "the original, which is left untouched. A .cue/.gdi/.toc is "
+            "always a CD image. An .iso is treated as a CD or a DVD "
+            "depending on its size (anything over about 800 MB is a DVD); "
+            "the toolbar dialog lets you override that, which the Explorer "
+            "menu cannot. A bare .bin can't be converted on its own — use "
+            "its .cue file.</p>"
+            "<p>CHD files can also be <b>opened</b>, browsed and edited like "
+            "an ISO, and <b>saved</b> as CHD (or any other format). Opening "
+            "unpacks the disc into a temporary image, so it needs free disk "
+            "space about the size of the uncompressed disc, and it is removed "
+            "again when you close the file. CD and DVD CHDs work; Dreamcast "
+            "GD-ROM and hard-disk CHDs can't be opened. A CHD saved from "
+            "ISOForge holds the disc's files exactly, but isn't a bit-for-bit "
+            "copy of a raw console CD.</p>"
             "<h4>ISO specifics</h4>"
             "<p>ISOs are built with UDF alongside ISO9660/Joliet/Rock Ridge, "
             "removing the classic 4GB single-file limit. If a disc's content "
@@ -2189,9 +2727,11 @@ def _parse_args(argv):
              "project.",
     )
 
-    # Verbs invoked by the Explorer context menu. Each receives exactly
-    # one path because Windows invokes a registry verb once per selected
-    # item; `single_instance` folds those launches back together.
+    # Verbs invoked by the Explorer context menu (--shell-open,
+    # --extract-here, --extract-to, --compress and --convert-chd). Each
+    # receives exactly one path because Windows invokes a registry verb
+    # once per selected item; `single_instance` folds those launches back
+    # together.
     parser.add_argument("--shell-open", dest="shell_open", default=None,
                         metavar="PATH", help=argparse.SUPPRESS)
     parser.add_argument("--extract-here", dest="extract_here", default=None,
@@ -2199,6 +2739,8 @@ def _parse_args(argv):
     parser.add_argument("--extract-to", dest="extract_to", default=None,
                         metavar="PATH", help=argparse.SUPPRESS)
     parser.add_argument("--compress", dest="compress", nargs="+", default=None,
+                        metavar="PATH", help=argparse.SUPPRESS)
+    parser.add_argument("--convert-chd", dest="convert_chd", default=None,
                         metavar="PATH", help=argparse.SUPPRESS)
 
     # Maintenance verbs used by the installer/uninstaller.
@@ -2239,16 +2781,42 @@ def run():
         return
 
     request = shell_commands.build_request(args)
+    payload = request.to_payload() if request is not None else None
 
-    # A context-menu verb goes to an already-running instance when there
-    # is one, which is what turns Explorer's one-process-per-file into a
-    # single grouped action.
+    # 1. A context-menu verb goes to an already-running instance when there
+    #    is one, which is what turns Explorer's one-process-per-file into a
+    #    single grouped action.
     if request is not None:
-        if single_instance.send_to_running_instance(request.to_payload()):
+        if single_instance.send_to_running_instance(payload):
             return
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+
+    # 2. CLAIM THE PRIMARY ROLE NOW -- before settings, theme, icons or the
+    #    main window exist. Explorer starts one process per selected file,
+    #    all within a few milliseconds of each other, and building the window
+    #    takes long enough that if listening only began afterwards, every one
+    #    of those processes would still find nobody listening and open a
+    #    session of its own. Claiming first makes the winner unambiguous: the
+    #    claim is atomic, so exactly one process gets it. See the module
+    #    docstring of `single_instance` for the full explanation.
+    batcher = single_instance.RequestBatcher()
+    is_primary = batcher.listen()
+
+    # 3. Every process that LOST the race hands its file to the winner and
+    #    quits without ever building a window. The winner exists (it holds
+    #    the name) but may still be starting up, so a few short retries are
+    #    allowed before giving up and handling the request alone.
+    if request is not None and not is_primary:
+        if single_instance.send_to_running_instance(
+                payload, attempts=8, retry_delay_ms=250):
+            return
+        # The primary went away before we could reach it (a headless one
+        # finishes and exits). Try to take over, so any launches still to
+        # come have somewhere to go.
+        is_primary = batcher.listen()
+
     app.setWindowIcon(icons.icon_disc_logo())
     _apply_base_font(app)
 
@@ -2264,26 +2832,37 @@ def run():
 
     window = MainWindow()
 
-    # Headless only while serving an extract verb: the window stays
+    # Headless only while serving an extract / CHD verb: the window stays
     # hidden, and the process exits once the work is done.
     headless = request is not None and not request.wants_window
 
+    # A headless process does not quit the instant it finishes: the rest of
+    # the same selection may still be on its way (see `single_instance`), and
+    # quitting would turn those launches away. It lingers briefly, and the
+    # clock restarts whenever another batch arrives.
+    idle_quit = QTimer()
+    idle_quit.setSingleShot(True)
+    idle_quit.timeout.connect(app.quit)
+
     def handle_batch(payloads):
+        idle_quit.stop()
         requests = [shell_commands.request_from_payload(p) for p in payloads]
         merged = shell_commands.merge_requests([r for r in requests if r])
         if merged is None:
+            if headless:
+                idle_quit.start(_HEADLESS_LINGER_MS)
             return
         should_quit = window.handle_shell_request(merged)
         if should_quit and headless:
-            QTimer.singleShot(0, app.quit)
+            idle_quit.start(_HEADLESS_LINGER_MS)
 
-    batcher = single_instance.RequestBatcher(handle_batch)
-    # Failing to listen is survivable: this process simply handles its
-    # own request alone, which is the pre-batching behaviour.
-    batcher.listen()
+    batcher.set_handler(handle_batch)
 
     if request is not None:
-        batcher.add_local(request.to_payload())
+        # Queued last, so the debounce timer starts just before the event
+        # loop does -- connections that arrived while the window was being
+        # built are read first and extend the wait, rather than racing it.
+        batcher.add_local(payload)
         if request.wants_window:
             window.show()
     else:
@@ -2298,3 +2877,7 @@ def run():
     exit_code = app.exec()
     batcher.close()
     sys.exit(exit_code)
+
+
+
+

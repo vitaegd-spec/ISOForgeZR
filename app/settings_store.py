@@ -3,8 +3,8 @@ settings_store.py
 -----------------
 Persistence for the external-tool paths configured in Tools > Settings.
 
-Why this is separate from `rar_tools` / `sfx_tools`
-====================================================
+Why this is separate from `rar_tools` / `sfx_tools` / `chd_tools`
+=================================================================
 Those modules are deliberately Qt-free so that `archive_backend` (which
 imports them) stays importable and testable without a GUI. This module
 is the Qt-aware other half: it owns the QSettings keys, and pushes the
@@ -24,6 +24,7 @@ from typing import Optional, Tuple
 
 from PySide6.QtCore import QSettings
 
+from . import chd_tools
 from . import rar_tools
 from . import sfx_tools
 
@@ -33,8 +34,9 @@ from . import sfx_tools
 KEY_RAR = "tools/rarPath"
 KEY_UNRAR = "tools/unrarPath"
 KEY_SFX = "tools/sfxStub"
+KEY_CHDMAN = "tools/chdmanPath"
 
-SETTINGS_KEYS = (KEY_RAR, KEY_UNRAR, KEY_SFX)
+SETTINGS_KEYS = (KEY_RAR, KEY_UNRAR, KEY_SFX, KEY_CHDMAN)
 
 
 def _settings(org: str, app: str) -> QSettings:
@@ -49,6 +51,21 @@ def load(org: str, app: str) -> Tuple[str, str, str]:
     unrar = s.value(KEY_UNRAR, "") or ""
     sfx = s.value(KEY_SFX, "") or ""
     return str(rar), str(unrar), str(sfx)
+
+
+def load_chdman(org: str, app: str) -> str:
+    """Returns the saved chdman.exe path; empty if never set.
+
+    Kept separate from `load()` so that function's three-value return --
+    and every caller unpacking it -- stays exactly as it was."""
+    return str(_settings(org, app).value(KEY_CHDMAN, "") or "")
+
+
+def save_chdman(org: str, app: str, chdman_path: Optional[str]) -> None:
+    """Persists the chdman.exe path AND applies it immediately, so a
+    newly-saved path takes effect without restarting."""
+    _settings(org, app).setValue(KEY_CHDMAN, (chdman_path or "").strip())
+    chd_tools.configure(chdman_path)
 
 
 def save(org: str, app: str,
@@ -74,3 +91,5 @@ def apply_to_runtime(org: str, app: str) -> None:
     rar, unrar, sfx = load(org, app)
     rar_tools.configure(rar, unrar)
     sfx_tools.configure(sfx)
+    chd_tools.configure(load_chdman(org, app))
+

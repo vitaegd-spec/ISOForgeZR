@@ -3,16 +3,17 @@ shell_commands.py
 -----------------
 Turns Explorer's context-menu invocations into ISOForge actions.
 
-Four verbs are registered (see `shell_integration.py`):
+Five verbs are registered (see `shell_integration.py`):
 
     --shell-open PATH     open the archive in the normal editor window
     --extract-here PATH   unpack beside the archive, no window
     --extract-to PATH     unpack into a new subfolder, no window
     --compress PATH       stage file(s)/folder(s) into a fresh project
+    --convert-chd PATH    convert a disc image to CHD beside it, no window
 
-The two extract verbs deliberately run WITHOUT showing the main window:
-the user asked for files on disk, not an editor, so they get a progress
-dialog and a confirmation and nothing else. `--compress` and
+The extract verbs and `--convert-chd` deliberately run WITHOUT showing the
+main window: the user asked for a file on disk, not an editor, so they get
+a progress dialog and a confirmation and nothing else. `--compress` and
 `--shell-open` do show the window, because the user's next step is to
 choose a format and save.
 
@@ -25,8 +26,8 @@ single action. Merging rules:
   * several `--compress` launches become ONE project containing every
     path -- this is the case that matters, since it's what a multi-file
     selection produces;
-  * several extract launches are performed in sequence within one
-    process, rather than spawning a window each;
+  * several extract (or CHD conversion) launches are performed in
+    sequence within one process, rather than spawning a window each;
   * a mixed batch (which shouldn't normally happen, since a selection
     triggers one verb) falls back to the first request's verb so
     something sensible still happens.
@@ -41,8 +42,12 @@ OPEN = "open"
 EXTRACT_HERE = "extract-here"
 EXTRACT_TO = "extract-to"
 COMPRESS = "compress"
+CONVERT_CHD = "convert-chd"
 
 _EXTRACT_ACTIONS = (EXTRACT_HERE, EXTRACT_TO)
+
+# Verbs that do their work and exit without ever showing the editor.
+_HEADLESS_ACTIONS = _EXTRACT_ACTIONS + (CONVERT_CHD,)
 
 
 class ShellRequest:
@@ -59,8 +64,12 @@ class ShellRequest:
         return self.action in _EXTRACT_ACTIONS
 
     @property
+    def is_convert_chd(self) -> bool:
+        return self.action == CONVERT_CHD
+
+    @property
     def wants_window(self) -> bool:
-        return not self.is_extract
+        return self.action not in _HEADLESS_ACTIONS
 
     def to_payload(self) -> dict:
         return {"action": self.action, "paths": list(self.paths)}
@@ -82,6 +91,8 @@ def build_request(args) -> Optional[ShellRequest]:
         return ShellRequest(EXTRACT_HERE, [args.extract_here])
     if getattr(args, "extract_to", None):
         return ShellRequest(EXTRACT_TO, [args.extract_to])
+    if getattr(args, "convert_chd", None):
+        return ShellRequest(CONVERT_CHD, [args.convert_chd])
     if getattr(args, "shell_open", None):
         return ShellRequest(OPEN, [args.shell_open])
     return None
@@ -90,7 +101,7 @@ def build_request(args) -> Optional[ShellRequest]:
 def request_from_payload(payload: dict) -> Optional[ShellRequest]:
     action = (payload or {}).get("action")
     paths = (payload or {}).get("paths") or []
-    if action not in (OPEN, EXTRACT_HERE, EXTRACT_TO, COMPRESS):
+    if action not in (OPEN, EXTRACT_HERE, EXTRACT_TO, COMPRESS, CONVERT_CHD):
         return None
     cleaned = [str(p) for p in paths if p]
     if not cleaned:
@@ -181,3 +192,4 @@ def suggested_archive_name(paths: List[str]) -> str:
     parent = os.path.basename(
         os.path.dirname(os.path.abspath(paths[0].rstrip("\\/"))))
     return parent or "Archive"
+

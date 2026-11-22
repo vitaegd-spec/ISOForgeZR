@@ -3,15 +3,17 @@ settings_dialog.py
 ------------------
 The Tools > Settings dialog.
 
-Three sections:
+Four sections:
 
   * **External Tools** -- locating RARLAB's `Rar.exe` / `UnRAR.exe`,
     which is what unlocks full RAR support (see `rar_tools`' docstring
     for why those tools can't simply be bundled).
   * **Self-extracting archives** -- locating the stub module used to
     build `.exe` archives (see `sfx_tools`).
+  * **CHD conversion** -- locating MAME's `chdman.exe`, which is what
+    "Convert to CHD" drives (see `chd_tools`).
   * **Windows Explorer** -- the right-click menu integration (see
-    `shell_integration`).
+    `shell_integration`), including the Convert-to-CHD item.
 
 Design notes
 =============
@@ -34,7 +36,7 @@ could ever act on.
 
 Scrolling
 ==========
-Three full sections -- each with its own heading, description, input
+Four full sections -- each with its own heading, description, input
 row(s) and status/hint text -- comfortably exceed a laptop's available
 screen height once fit-to-content sizing is applied, and Qt does not
 shrink a dialog's content to fit the screen on its own. Without a scroll
@@ -43,7 +45,7 @@ on any display shorter than the fully-expanded content, which is exactly
 what the fixed-height QVBoxLayout that used to hold everything directly
 produced.
 
-The fix is the standard one: the three sections go inside a QScrollArea,
+The fix is the standard one: the four sections go inside a QScrollArea,
 and only the button row sits outside it in the dialog's own layout. That
 keeps OK/Cancel permanently visible and reachable regardless of screen
 height, while the sections above scroll as needed. `setWidgetResizable`
@@ -58,25 +60,27 @@ from typing import Optional, Tuple
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
+    QCheckBox, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QVBoxLayout,
     QWidget,
 )
 
+from . import chd_tools
 from . import rar_tools
 from . import sfx_tools
 from . import shell_integration
+from .dialog_base import ForgeDialog
 
 _OK_COLOR = "#39B37E"
 _BAD_COLOR = "#E5566D"
 _IDLE_COLOR = "#8A93A6"
 
 
-class SettingsDialog(QDialog):
+class SettingsDialog(ForgeDialog):
     """Point ISOForge at external helper tools and configure Explorer."""
 
     def __init__(self, parent, rar_path: str = "", unrar_path: str = "",
-                 sfx_path: str = ""):
+                 sfx_path: str = "", chdman_path: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(660)
@@ -87,14 +91,13 @@ class SettingsDialog(QDialog):
         # larger size if the user drags it) while the scroll area below
         # guarantees the buttons stay reachable however small it gets.
         self.resize(660, 720)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
         # -- scrollable content -------------------------------------- #
-        # All three sections go here, NOT directly in the dialog's own
+        # All four sections go here, NOT directly in the dialog's own
         # layout -- see the module docstring for why that's what keeps
         # OK/Cancel reachable on a short screen.
         scroll = QScrollArea()
@@ -130,6 +133,7 @@ class SettingsDialog(QDialog):
 
         self._build_tools_section(content_layout, rar_path, unrar_path)
         self._build_sfx_section(content_layout, sfx_path)
+        self._build_chd_section(content_layout, chdman_path)
         self._build_shell_section(content_layout)
         content_layout.addStretch(1)
 
@@ -149,6 +153,7 @@ class SettingsDialog(QDialog):
         self.rar_edit.textChanged.connect(self._refresh_status)
         self.unrar_edit.textChanged.connect(self._refresh_status)
         self.sfx_edit.textChanged.connect(self._refresh_status)
+        self.chd_edit.textChanged.connect(self._refresh_status)
         self._refresh_status()
 
     # ------------------------------------------------------- tools
@@ -258,6 +263,58 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(card)
 
+    # --------------------------------------------------------- chd
+    def _build_chd_section(self, layout, chdman_path: str) -> None:
+        title = QLabel("CHD Conversion")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+
+        intro = QLabel(
+            "CHD is the compressed, lossless disc-image format used by MAME "
+            "and most emulators. ISOForge converts .cue, .gdi, .toc and .iso "
+            "images to CHD by driving MAME's own chdman.exe, so point to "
+            "your copy below."
+        )
+        intro.setObjectName("Muted")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        card = QFrame()
+        card.setObjectName("Card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(10)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        self.chd_edit, chd_row = self._path_row(self._browse_chdman)
+        self.chd_edit.setText(chdman_path or "")
+        form.addRow("chdman.exe:", chd_row)
+        self.chd_status = self._status_label()
+        form.addRow("", self.chd_status)
+        card_layout.addLayout(form)
+
+        note = QLabel(
+            "<b>chdman.exe</b> ships with MAME (free). Leave the field empty "
+            "to search automatically — ISOForge looks beside the "
+            "application (or in a <code>tools</code> folder there), on your "
+            "PATH, and in a <code>MAME</code> folder under Program Files."
+        )
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        note.setTextFormat(Qt.RichText)
+        card_layout.addWidget(note)
+
+        detect_row = QHBoxLayout()
+        detect_btn = QPushButton("Detect Automatically")
+        detect_btn.setProperty("flat", True)
+        detect_btn.clicked.connect(self._detect_chdman)
+        detect_row.addWidget(detect_btn)
+        detect_row.addStretch(1)
+        card_layout.addLayout(detect_row)
+
+        layout.addWidget(card)
+
     # ------------------------------------------------------- shell
     def _build_shell_section(self, layout) -> None:
         """Explorer integration controls.
@@ -270,6 +327,7 @@ class SettingsDialog(QDialog):
         if not self._shell_supported:
             self.shell_archive_check = None
             self.shell_create_check = None
+            self.shell_chd_check = None
             self.shell_status = None
             return
 
@@ -279,8 +337,8 @@ class SettingsDialog(QDialog):
 
         intro = QLabel(
             "Add ISOForge to the right-click menu, so archives can be "
-            "opened or extracted — and files compressed — straight from "
-            "Explorer."
+            "opened or extracted, files compressed, and disc images "
+            "converted to CHD — straight from Explorer."
         )
         intro.setObjectName("Muted")
         intro.setWordWrap(True)
@@ -302,6 +360,11 @@ class SettingsDialog(QDialog):
         self.shell_create_check.setChecked(shell_integration.create_registered())
         card_layout.addWidget(self.shell_create_check)
 
+        self.shell_chd_check = QCheckBox(
+            "Disc images (.cue, .gdi, .toc, .iso)  —  Convert to CHD")
+        self.shell_chd_check.setChecked(shell_integration.chd_registered())
+        card_layout.addWidget(self.shell_chd_check)
+
         self.shell_status = QLabel(shell_integration.status_summary())
         self.shell_status.setObjectName("Muted")
         self.shell_status.setWordWrap(True)
@@ -310,6 +373,7 @@ class SettingsDialog(QDialog):
         hint = QLabel(
             "Applies to your account only — no administrator rights needed, "
             "and your existing file associations are left alone.<br>"
+            "The CHD item needs chdman.exe (above) when you use it.<br>"
             "On Windows 11 these appear under <b>Show more options</b>."
         )
         hint.setObjectName("Muted")
@@ -364,6 +428,13 @@ class SettingsDialog(QDialog):
         if path:
             self.sfx_edit.setText(path)
 
+    def _browse_chdman(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Locate chdman.exe", self._start_dir(self.chd_edit),
+            self._executable_filter())
+        if path:
+            self.chd_edit.setText(path)
+
     @staticmethod
     def _start_dir(edit: QLineEdit) -> str:
         current = (edit.text() or "").strip()
@@ -398,6 +469,19 @@ class SettingsDialog(QDialog):
             found_unrar if found_unrar and found_unrar != found_rar else "")
         self._refresh_status()
 
+    def _detect_chdman(self) -> None:
+        """Clears the chdman field and lets auto-detection speak for itself
+        (same approach as `_detect` above: the resolver only searches when
+        nothing is configured)."""
+        previous = chd_tools.configured_chdman()
+        chd_tools.configure(None)
+        try:
+            found = chd_tools.resolve_chdman() or ""
+        finally:
+            chd_tools.configure(previous)
+        self.chd_edit.setText(found)
+        self._refresh_status()
+
     def _refresh_status(self, *_args) -> None:
         # Accepts (and ignores) any payload, because this is wired to
         # QLineEdit.textChanged, which emits the new text. Matching the
@@ -427,6 +511,14 @@ class SettingsDialog(QDialog):
             enabled_text="Self-extracting archives can be created.",
             missing_text=("Not found — install 7-Zip, or choose a module "
                           "such as 7z.sfx."),
+        )
+        self._apply_status(
+            self.chd_status, self.chd_edit.text(),
+            chd_tools.resolve_chdman, chd_tools.probe_tool,
+            chd_tools.configure, (chd_tools.configured_chdman,),
+            enabled_text="Disc images can be converted to CHD.",
+            missing_text=("Not found — set chdman.exe (it ships with MAME) "
+                          "to enable Convert to CHD."),
         )
 
     def _apply_status(self, label: QLabel, typed: str, resolver, prober,
@@ -479,9 +571,16 @@ class SettingsDialog(QDialog):
                 self.unrar_edit.text().strip(),
                 self.sfx_edit.text().strip())
 
-    def shell_values(self) -> Optional[Tuple[bool, bool]]:
-        """(archives, files_and_folders), or None where unsupported."""
+    def chdman_value(self) -> str:
+        """The chdman.exe path, trimmed (empty means auto-detect)."""
+        return self.chd_edit.text().strip()
+
+    def shell_values(self) -> Optional[Tuple[bool, bool, bool]]:
+        """(archives, files_and_folders, chd), or None where unsupported."""
         if not self._shell_supported:
             return None
         return (self.shell_archive_check.isChecked(),
-                self.shell_create_check.isChecked())
+                self.shell_create_check.isChecked(),
+                self.shell_chd_check.isChecked())
+
+

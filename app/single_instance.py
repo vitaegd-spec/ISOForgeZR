@@ -38,6 +38,28 @@ Windows also caps how many files it will invoke a verb for (15 by
 default), so very large selections are truncated by Explorer before
 ISOForge ever sees them -- a shell limitation, not one introduced here.
 
+Winning the race -- claim FIRST, build the window SECOND
+==========================================================
+Explorer starts all the processes within a few milliseconds of each other.
+If each one checked "is anyone listening yet?" and then spent a second
+building its window before listening itself, every one of them would find
+nobody listening, and each would open a window of its own -- which is exactly
+what happened (two or three sessions for one selection).
+
+So the order in `main_window.run()` matters and is deliberate:
+
+  1. a quick check for an already-running instance (the common case);
+  2. create the application object -- the cheapest thing a listener needs;
+  3. `RequestBatcher.listen()` IMMEDIATELY, before settings, theme, icons or
+     the main window exist. Whichever process gets here first becomes the
+     primary; the claim is atomic, so there can only ever be one;
+  4. every process that LOST that race hands its file to the winner (with a
+     few short retries, since the winner may still be busy starting up) and
+     exits without ever building a window.
+
+Connections made while the primary is still starting simply queue and are
+read as soon as its event loop runs, so nothing is lost by it being slow.
+
 Graceful degradation
 =====================
 Every failure path falls back to "act alone". If the socket can't be
@@ -52,7 +74,7 @@ import getpass
 import json
 from typing import Callable, List, Optional
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QThread, QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 # Quiet period after the last incoming request before the batch is acted
@@ -79,13 +101,28 @@ def server_name() -> str:
     return f"ISOForgeZR-shell-{user}"
 
 
-def send_to_running_instance(payload: dict) -> bool:
+def send_to_running_instance(payload: dict, attempts: int = 1,
+                             retry_delay_ms: int = 0) -> bool:
     """Hands `payload` to an existing primary instance.
 
     Returns True only when the data was genuinely written and flushed --
     the caller uses that to decide whether it may exit. Any doubt returns
     False so the request is still handled locally rather than lost.
+
+    `attempts` > 1 retries after `retry_delay_ms`. That is for the process
+    that has just LOST the race to become primary: the winner exists (it holds
+    the name) but may still be starting up, so a first connection attempt can
+    be refused or time out even though a second a moment later succeeds.
     """
+    for attempt in range(max(1, attempts)):
+        if _try_send_once(payload):
+            return True
+        if attempt + 1 < attempts and retry_delay_ms > 0:
+            QThread.msleep(retry_delay_ms)
+    return False
+
+
+def _try_send_once(payload: dict) -> bool:
     socket = QLocalSocket()
     socket.connectToServer(server_name())
     if not socket.waitForConnected(_CONNECT_TIMEOUT_MS):
@@ -113,9 +150,14 @@ class RequestBatcher(QObject):
     been quiet for `_BATCH_DELAY_MS`.
     """
 
-    def __init__(self, handler: Callable[[List[dict]], None], parent=None):
+    def __init__(self, handler: Optional[Callable[[List[dict]], None]] = None,
+                 parent=None):
         super().__init__(parent)
+        # The handler may be supplied later (see `set_handler`): the batcher
+        # has to start LISTENING before the main window exists, but the
+        # handler needs that window.
         self._handler = handler
+        self._deferrals = 0
         self._pending: List[dict] = []
         self._buffers: dict = {}
         self._server: Optional[QLocalServer] = None
@@ -123,6 +165,9 @@ class RequestBatcher(QObject):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._flush)
+
+    def set_handler(self, handler: Callable[[List[dict]], None]) -> None:
+        self._handler = handler
 
     # -- lifecycle ----------------------------------------------------- #
     def listen(self) -> bool:
@@ -163,6 +208,23 @@ class RequestBatcher(QObject):
         return True
 
     def close(self) -> None:
+        self._timer.stop()
+        # Release every accepted connection BEFORE the server. They are
+        # children of the server, so Qt destroys them with it; letting the
+        # Python references in `_buffers` outlive that is what produced
+        # "shared QObject was deleted directly" if a sender was still
+        # connected at shutdown.
+        for socket in list(self._buffers):
+            try:
+                socket.disconnected.disconnect()
+                socket.readyRead.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                socket.abort()
+            except RuntimeError:
+                pass
+        self._buffers.clear()
         if self._server is not None:
             self._server.close()
             QLocalServer.removeServer(server_name())
@@ -182,6 +244,11 @@ class RequestBatcher(QObject):
             self._buffers[socket] = bytearray()
             socket.readyRead.connect(lambda s=socket: self._on_ready(s))
             socket.disconnected.connect(lambda s=socket: self._on_closed(s))
+            # A sender that connected and wrote while this process was busy
+            # may have its data waiting already, in which case no further
+            # readyRead is coming. Drain it now rather than depend on one.
+            if socket.bytesAvailable():
+                self._on_ready(socket)
 
     def _on_ready(self, socket: QLocalSocket) -> None:
         buffer = self._buffers.get(socket)
@@ -199,7 +266,11 @@ class RequestBatcher(QObject):
 
     def _on_closed(self, socket: QLocalSocket) -> None:
         # A sender that closed without a trailing newline still has a
-        # complete payload worth keeping.
+        # complete payload worth keeping. Anything still unread is taken
+        # first, so a payload that arrived together with the disconnect
+        # isn't dropped.
+        if socket.bytesAvailable():
+            self._on_ready(socket)
         buffer = self._buffers.pop(socket, None)
         if buffer:
             self._accept(bytes(buffer))
@@ -215,14 +286,32 @@ class RequestBatcher(QObject):
             return
         if isinstance(payload, dict):
             self._pending.append(payload)
+            self._deferrals = 0
             # Restarting the timer on every arrival is what makes this a
             # debounce rather than a fixed window: the batch closes once
             # the launches stop, however long they take to arrive.
             self._timer.start(_BATCH_DELAY_MS)
 
     # -- dispatch ------------------------------------------------------ #
+    # How many times a flush may be postponed because more launches are
+    # visibly still arriving. Bounded so a stuck connection can never delay
+    # the action indefinitely.
+    _MAX_DEFERRALS = 8
+
     def _flush(self) -> None:
         if not self._pending:
             return
+        # Connections waiting to be read, or still open and mid-delivery,
+        # mean more of the same selection is on its way: wait for them
+        # instead of acting on a partial batch.
+        busy = self._server is not None and (
+            self._server.hasPendingConnections() or bool(self._buffers))
+        if busy and self._deferrals < self._MAX_DEFERRALS:
+            self._deferrals += 1
+            self._timer.start(_BATCH_DELAY_MS // 2)
+            return
+        self._deferrals = 0
         batch, self._pending = self._pending, []
-        self._handler(batch)
+        if self._handler is not None:
+            self._handler(batch)
+

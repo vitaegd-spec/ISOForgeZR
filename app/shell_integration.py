@@ -5,7 +5,8 @@ Registers ISOForge's Windows Explorer right-click menu entries.
 
 What this produces
 ===================
-Two cascading submenus, the same shape WinRAR and 7-Zip use:
+Two cascading submenus (the same shape WinRAR and 7-Zip use) plus one
+plain menu item:
 
     Right-click a .zip / .7z / .rar / .iso
         ISOForge  >  Open with ISOForge
@@ -14,6 +15,16 @@ Two cascading submenus, the same shape WinRAR and 7-Zip use:
 
     Right-click any file(s) or folder(s)
         ISOForge  >  Compress with ISOForge...
+
+    Right-click a .cue / .gdi / .toc / .iso
+        Convert to CHD with ISOForge
+
+The CHD item is a plain verb rather than part of a cascade, because it is
+the only thing ISOForge adds for .cue/.gdi/.toc -- a flyout holding a single
+entry would just be an extra click. It is attached to the same
+`SystemFileAssociations` location as the archive menu (see below) under its
+own key, so toggling it never disturbs the archive menu on .iso and vice
+versa.
 
 WHERE the entries go -- extensions are not like `*`
 ====================================================
@@ -152,6 +163,18 @@ _DIRECTORY = "Directory"
 
 MENU_LABEL = "ISOForge"
 
+# --- CHD conversion -----------------------------------------------------
+# Disc-image types that get the "Convert to CHD" verb. Kept in step with
+# `chd_tools.SOURCE_EXTENSIONS` by hand rather than imported, so this module
+# stays a dependency-free leaf (it is also run from the installer with no
+# UI at all).
+CHD_EXTENSIONS: Tuple[str, ...] = (".cue", ".gdi", ".toc", ".iso")
+
+# A separate key name from `_VERB_KEY`, so the two can coexist on `.iso`.
+_CHD_VERB_KEY = "ISOForgeZR_CHD"
+CHD_MENU_LABEL = "Convert to CHD with ISOForge"
+_CHD_ARGUMENTS = '--convert-chd "%1"'
+
 # The flyout contents, as (sort_key, label, command arguments).
 #
 # The sort key becomes part of the registry key NAME because Explorer
@@ -247,6 +270,12 @@ def _verb_path(class_name: str) -> str:
     if class_name.startswith("."):
         return f"{_CLASSES}\\{_SFA}\\{class_name}\\shell\\{_VERB_KEY}"
     return f"{_CLASSES}\\{class_name}\\shell\\{_VERB_KEY}"
+
+
+def _chd_verb_path(extension: str) -> str:
+    """Where the Convert-to-CHD verb lives for one extension. Always under
+    `SystemFileAssociations`, for the reason given in the module docstring."""
+    return f"{_CLASSES}\\{_SFA}\\{extension}\\shell\\{_CHD_VERB_KEY}"
 
 
 def _legacy_ext_verb_path(extension: str) -> str:
@@ -376,6 +405,27 @@ def _detach_menu(class_name: str) -> None:
     _delete_tree(_verb_path(class_name))
 
 
+def _attach_chd(extension: str) -> None:
+    """Writes the single Convert-to-CHD verb for one extension.
+
+    A plain verb, not a cascade: just a label, an icon and a command. The
+    key is deleted first so a stale command from a moved install can't
+    survive alongside the new one.
+    """
+    path = _chd_verb_path(extension)
+    _delete_tree(path)
+    values = {"MUIVerb": CHD_MENU_LABEL}
+    icon = _icon_source()
+    if icon:
+        values["Icon"] = icon
+    _set_values(path, values)
+    _set_values(f"{path}\\command", {"": f"{launch_command()} {_CHD_ARGUMENTS}"})
+
+
+def _detach_chd(extension: str) -> None:
+    _delete_tree(_chd_verb_path(extension))
+
+
 def _clear_legacy() -> None:
     """Removes every layout ISOForge used before the current one.
 
@@ -412,12 +462,20 @@ def _notify_explorer() -> None:
 # --------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------- #
-def register(archives: bool = True, create: bool = True) -> None:
+def register(archives: bool = True, create: bool = True,
+             chd: Optional[bool] = None) -> None:
     """Installs the requested menus, removing any that were turned off.
 
-    Both flags are applied every time so the function can be used as a
-    straight "make the registry match these two checkboxes" call, rather
-    than the caller having to work out what changed.
+    `archives` and `create` are applied every time so the function can be
+    used as a straight "make the registry match these checkboxes" call,
+    rather than the caller having to work out what changed.
+
+    `chd` is tri-state: True installs the Convert-to-CHD verbs, False
+    removes them, and None (the default) leaves them exactly as they are.
+    None matters because the installer's silent `--register-shell` calls
+    this with only the two original flags; treating "unspecified" as "off"
+    would quietly delete the CHD menu the user had enabled every time the
+    app was upgraded.
     """
     _require()
 
@@ -434,6 +492,13 @@ def register(archives: bool = True, create: bool = True) -> None:
     else:
         _detach_menu(_ALL_FILES)
         _detach_menu(_DIRECTORY)
+
+    if chd is True:
+        for ext in CHD_EXTENSIONS:
+            _attach_chd(ext)
+    elif chd is False:
+        for ext in CHD_EXTENSIONS:
+            _detach_chd(ext)
 
     # Nothing references the older layouts any more; clear them out of
     # installations registered by an earlier build.
@@ -452,6 +517,8 @@ def unregister() -> None:
     _require()
     for cls in _all_attachment_classes():
         _detach_menu(cls)
+    for ext in CHD_EXTENSIONS:
+        _detach_chd(ext)
     _clear_legacy()
     _notify_explorer()
 
@@ -475,6 +542,30 @@ def create_registered() -> bool:
         return False
     return any(_key_exists(f"{_verb_path(cls)}\\shell")
                for cls in (_ALL_FILES, _DIRECTORY))
+
+
+def chd_registered() -> bool:
+    """True when at least one disc-image type carries the CHD verb.
+
+    Checks for the `command` subkey rather than just the verb key, for the
+    same reason as `archives_registered`: a half-written entry must not
+    count as registered.
+    """
+    if not is_supported():
+        return False
+    return any(_key_exists(f"{_chd_verb_path(ext)}\\command")
+               for ext in CHD_EXTENSIONS)
+
+
+def registered_chd_command() -> Optional[str]:
+    """The Convert-to-CHD command currently registered, or None."""
+    if not is_supported():
+        return None
+    for ext in CHD_EXTENSIONS:
+        value = _read_value(f"{_chd_verb_path(ext)}\\command", "")
+        if value:
+            return value
+    return None
 
 
 def registered_command() -> Optional[str]:
@@ -527,10 +618,11 @@ def needs_refresh() -> bool:
         return False
     if _uses_legacy_layout():
         return True
-    current = registered_command()
-    if not current:
-        return False
-    return not current.startswith(launch_command())
+    prefix = launch_command()
+    for current in (registered_command(), registered_chd_command()):
+        if current and not current.startswith(prefix):
+            return True
+    return False
 
 
 def status_summary() -> str:
@@ -544,7 +636,8 @@ def status_summary() -> str:
 
     archives = archives_registered()
     create = create_registered()
-    if not archives and not create:
+    chd = chd_registered()
+    if not archives and not create and not chd:
         return "Not currently added to the Explorer menu."
     if needs_refresh():
         return ("Added, but pointing at a different copy of ISOForge — "
@@ -555,4 +648,7 @@ def status_summary() -> str:
         parts.append("archives")
     if create:
         parts.append("files and folders")
+    if chd:
+        parts.append("disc images (Convert to CHD)")
     return "Added to the Explorer menu for " + " and ".join(parts) + "."
+
